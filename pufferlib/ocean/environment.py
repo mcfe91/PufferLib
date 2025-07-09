@@ -155,6 +155,7 @@ MAKE_FUNCTIONS = {
     'asteroids': 'Asteroids',
     'spaces': make_spaces,
     'multiagent': make_multiagent,
+    'music_gen': 'MusicGen'
 }
 
 def env_creator(name='squared', *args, **kwargs):
