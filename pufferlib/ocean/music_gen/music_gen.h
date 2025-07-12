@@ -1,11 +1,97 @@
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include "raylib.h"
+
+// Client struct for graphics
+typedef struct Client {
+    int width;
+    int height;
+} Client;
+
+Client* make_client() {
+    Client* client = (Client*)malloc(sizeof(Client));
+    client->width = 1080;
+    client->height = 720;
+    InitWindow(client->width, client->height, "PufferLib Music Generator");
+    SetTargetFPS(30);
+    return client;
+}
+
+void close_client(Client* client) {
+    CloseWindow();
+    free(client);
+}
+
+// Helper functions for C compatibility
+static inline float min_f(float a, float b) { return (a < b) ? a : b; }
+static inline float max_f(float a, float b) { return (a > b) ? a : b; }
+static inline int min_i(int a, int b) { return (a < b) ? a : b; }
+static inline int max_i(int a, int b) { return (a > b) ? a : b; }
 
 const Color PUFF_RED = (Color){187, 0, 0, 255};
 const Color PUFF_CYAN = (Color){0, 187, 187, 255};
 const Color PUFF_WHITE = (Color){241, 241, 241, 241};
 const Color PUFF_BACKGROUND = (Color){6, 24, 24, 255};
+const Color PUFF_GREEN = (Color){0, 187, 0, 255};
+const Color PUFF_YELLOW = (Color){187, 187, 0, 255};
+
+// Audio engine constants
+#define NUM_TRACKS 4
+#define OBS_DIM 128
+#define ACTION_DIM 336  // 80 + 4 * 16 * 4
+#define SAMPLE_RATE 44100
+#define BUFFER_SIZE SAMPLE_RATE * 2 // 1 bar at 120 BPM (2 seconds)
+
+// Audio environment structure (embedded directly)
+typedef struct {
+    // Audio buffers
+    float track_buffers[NUM_TRACKS][BUFFER_SIZE];
+    float master_buffer[BUFFER_SIZE];
+    
+    // Synth state (per track)
+    struct {
+        float oscillator_mix;      // 0-1: Sine to saw mix
+        float filter_cutoff;       // 0-1: 20Hz to 20kHz
+        float filter_resonance;    // 0-1: No resonance to high resonance
+        float envelope_attack;     // 0-1: 0ms to 1000ms
+        float envelope_release;    // 0-1: 0ms to 2000ms
+        float pitch;               // MIDI note (36-84)
+        float volume;              // 0-1: Silent to unity gain
+        float pan;                 // -1 to 1: Left to right
+        
+        // Filter state variables
+        float filter_state[2];
+        
+        struct Note {
+            bool active;              // Is the note playing
+            float pitch;              // Absolute MIDI note value
+            int duration_samples;     // Duration in samples
+            float velocity;           // Volume/intensity (0.0-1.0)
+        } notes[16];                  // 16-step pattern
+    } tracks[NUM_TRACKS];
+    
+    // Global state
+    int current_step;              // Current sequencer step
+    float tempo;                   // BPM
+    float master_volume;           // 0-1: Master volume
+    
+    // Global effects
+    struct {
+        float reverb_size;         // 0-1: Room size
+        float reverb_damping;      // 0-1: High frequency damping
+        float delay_time;          // 0-1: 0ms to 1000ms
+        float delay_feedback;      // 0-1: No feedback to high feedback
+        
+        // Effect state variables
+        float reverb_buffer[8192]; // Reverb memory
+        float delay_buffer[SAMPLE_RATE]; // 1 second delay
+        int delay_index;           // Current position in delay buffer
+    } effects;
+} AudioEnvironment;
 
 // Only use floats!
 typedef struct {
@@ -15,65 +101,429 @@ typedef struct {
 
 typedef struct {
     Log log;                     // Required field
-    unsigned char* observations; // Required field. Ensure type matches in .py and .c
-    int* actions;                // Required field. Ensure type matches in .py and .c
+    float* observations;         // 128-dimensional float observations
+    float* actions;              // 336-dimensional float actions
     float* rewards;              // Required field
     unsigned char* terminals;    // Required field
-    int size;
-    int x;
-    int goal;
+    
+    // Audio engine state
+    AudioEnvironment audio_env;  // Embedded audio environment
+    int env_initialized;         // Initialization flag
+    Client* client;              // Graphics client
 } MusicGen;
 
+// Initialize audio environment
+void init_audio_environment(AudioEnvironment* env) {
+    // Clear audio buffers
+    memset(env->track_buffers, 0, sizeof(env->track_buffers));
+    memset(env->master_buffer, 0, sizeof(env->master_buffer));
+    
+    // Initialize tracks with default values
+    for (int t = 0; t < NUM_TRACKS; t++) {
+        env->tracks[t].oscillator_mix = 0.0f;      // Pure sine
+        env->tracks[t].filter_cutoff = 0.8f;       // Fairly open filter
+        env->tracks[t].filter_resonance = 0.2f;    // Slight resonance
+        env->tracks[t].envelope_attack = 0.1f;     // Quick attack
+        env->tracks[t].envelope_release = 0.5f;    // Medium release
+        env->tracks[t].pitch = 48.0f + t * 12.0f;  // C3, C4, C5, C6
+        env->tracks[t].volume = 0.7f;              // 70% volume
+        env->tracks[t].pan = (t % 2 == 0) ? -0.3f : 0.3f; // Alternate panning
+        
+        // Clear filter state
+        memset(env->tracks[t].filter_state, 0, sizeof(env->tracks[t].filter_state));
+        
+        // Initialize notes
+        for (int s = 0; s < 16; s++) {
+            env->tracks[t].notes[s].active = false;
+            env->tracks[t].notes[s].pitch = 48.0f + t * 12.0f;  // C3, C4, C5, C6
+            env->tracks[t].notes[s].duration_samples = BUFFER_SIZE / 16; // One step
+            env->tracks[t].notes[s].velocity = 0.7f;
+        }
+    }
+    
+    // Initialize global state
+    env->current_step = 0;
+    env->tempo = 120.0f;
+    env->master_volume = 0.8f;
+    
+    // Initialize effects
+    env->effects.reverb_size = 0.3f;
+    env->effects.reverb_damping = 0.5f;
+    env->effects.delay_time = 0.25f;
+    env->effects.delay_feedback = 0.3f;
+    
+    // Clear effect buffers
+    memset(env->effects.reverb_buffer, 0, sizeof(env->effects.reverb_buffer));
+    memset(env->effects.delay_buffer, 0, sizeof(env->effects.delay_buffer));
+    env->effects.delay_index = 0;
+}
+
+// Generate audio for a full bar
+void generate_audio(AudioEnvironment* env) {
+    // Clear master buffer
+    memset(env->master_buffer, 0, sizeof(env->master_buffer));
+    
+    // Calculate samples per step
+    int samples_per_step = BUFFER_SIZE / 16;
+    
+    // Process each track
+    for (int t = 0; t < NUM_TRACKS; t++) {
+        // Clear track buffer
+        memset(env->track_buffers[t], 0, sizeof(env->track_buffers[t]));
+        
+        // Process each step in the pattern
+        for (int s = 0; s < 16; s++) {
+            if (env->tracks[t].notes[s].active) {
+                int step_start = s * samples_per_step;
+                int note_duration = env->tracks[t].notes[s].duration_samples;
+                int step_end = step_start + note_duration;
+                step_end = min_i(step_end, BUFFER_SIZE);
+                
+                // Calculate frequency from MIDI note
+                float frequency = 440.0f * powf(2.0f, (env->tracks[t].notes[s].pitch - 69.0f) / 12.0f);
+                float mix = env->tracks[t].oscillator_mix;
+                
+                // Generate waveform
+                for (int i = step_start; i < step_end; i++) {
+                    float sample_offset = (float)(i - step_start);
+                    float phase = sample_offset / SAMPLE_RATE * frequency;
+                    phase -= floorf(phase); // Normalize to 0-1
+                    
+                    // Generate sine and saw components
+                    float sine_val = sinf(phase * 2.0f * M_PI);
+                    float saw_val = 2.0f * phase - 1.0f;
+                    
+                    // Mix between sine and saw
+                    env->track_buffers[t][i] += (sine_val * (1.0f - mix) + saw_val * mix) * env->tracks[t].notes[s].velocity;
+                }
+                
+                // Apply envelope and filter (simplified for brevity)
+                float attack = env->tracks[t].envelope_attack * SAMPLE_RATE * 0.1f;
+                // Note: release envelope logic removed for simplicity in this version
+                
+                for (int i = step_start; i < step_end; i++) {
+                    float envelope = 1.0f;
+                    float position = (float)(i - step_start);
+                    
+                    if (position < attack) {
+                        envelope = position / attack;
+                    }
+                    
+                    env->track_buffers[t][i] *= envelope;
+                }
+            }
+        }
+        
+        // Apply track volume and add to master
+        float volume = env->tracks[t].volume;
+        for (int i = 0; i < BUFFER_SIZE; i++) {
+            env->master_buffer[i] += env->track_buffers[t][i] * volume;
+        }
+    }
+    
+    // Apply master volume and limiting
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+        env->master_buffer[i] *= env->master_volume;
+        if (env->master_buffer[i] > 1.0f) env->master_buffer[i] = 1.0f;
+        if (env->master_buffer[i] < -1.0f) env->master_buffer[i] = -1.0f;
+    }
+}
+
+// Apply action to environment
+void apply_action(AudioEnvironment* env, const float* action) {
+    int action_idx = 0;
+    
+    // First 16 actions: track parameters (4 tracks * 4 params)
+    for (int t = 0; t < NUM_TRACKS && action_idx < ACTION_DIM; t++) {
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].volume += action[action_idx] * 0.1f;
+            env->tracks[t].volume = min_f(1.0f, max_f(0.0f, env->tracks[t].volume));
+            action_idx++;
+        }
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].filter_cutoff += action[action_idx] * 0.1f;
+            env->tracks[t].filter_cutoff = min_f(1.0f, max_f(0.0f, env->tracks[t].filter_cutoff));
+            action_idx++;
+        }
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].oscillator_mix += action[action_idx] * 0.1f;
+            env->tracks[t].oscillator_mix = min_f(1.0f, max_f(0.0f, env->tracks[t].oscillator_mix));
+            action_idx++;
+        }
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].pan += action[action_idx] * 0.1f;
+            env->tracks[t].pan = min_f(1.0f, max_f(-1.0f, env->tracks[t].pan));
+            action_idx++;
+        }
+    }
+    
+    // Remaining actions: sequencer patterns (4 tracks * 16 steps * 4 params)
+    int samples_per_step = BUFFER_SIZE / 16;
+    
+    for (int t = 0; t < NUM_TRACKS && action_idx < ACTION_DIM; t++) {
+        for (int s = 0; s < 16 && action_idx < ACTION_DIM; s++) {
+            // On/off state
+            if (action_idx < ACTION_DIM) {
+                if (action[action_idx] > 0.1f) {
+                    env->tracks[t].notes[s].active = true;
+                } else if (action[action_idx] < -0.1f) {
+                    env->tracks[t].notes[s].active = false;
+                }
+                action_idx++;
+            }
+            
+            // Pitch
+            if (action_idx < ACTION_DIM) {
+                float pitch_offset = action[action_idx] * 12.0f;
+                env->tracks[t].notes[s].pitch = 48.0f + t * 12.0f + pitch_offset;
+                action_idx++;
+            }
+            
+            // Duration
+            if (action_idx < ACTION_DIM) {
+                float steps_duration = (action[action_idx] + 1.0f) * 2.0f;
+                env->tracks[t].notes[s].duration_samples = (int)(steps_duration * samples_per_step);
+                action_idx++;
+            }
+            
+            // Velocity
+            if (action_idx < ACTION_DIM) {
+                env->tracks[t].notes[s].velocity = (action[action_idx] + 1.0f) * 0.5f;
+                action_idx++;
+            }
+        }
+    }
+}
+
+// Calculate reward based on audio quality
+float calculate_reward(AudioEnvironment* env) {
+    // Extract basic audio features for reward calculation
+    float rms = 0.0f;         // RMS amplitude
+    float peak = 0.0f;        // Peak amplitude
+    float spectral_centroid = 0.0f;  // Simplified approximation
+    float dynamic_range = 0.0f;
+    
+    // Calculate RMS and peak
+    for (int i = 0; i < BUFFER_SIZE; i++) {
+        float sample = env->master_buffer[i];
+        rms += sample * sample;
+        if (fabs(sample) > peak) peak = fabs(sample);
+    }
+    rms = sqrtf(rms / BUFFER_SIZE);
+    
+    // Approximate spectral centroid using zero-crossing rate (very simplified)
+    int zero_crossings = 0;
+    for (int i = 1; i < BUFFER_SIZE; i++) {
+        if ((env->master_buffer[i] >= 0 && env->master_buffer[i-1] < 0) ||
+            (env->master_buffer[i] < 0 && env->master_buffer[i-1] >= 0)) {
+            zero_crossings++;
+        }
+    }
+    spectral_centroid = (float)zero_crossings / BUFFER_SIZE;
+    
+    // Approximate dynamic range
+    float sum_of_diffs = 0.0f;
+    for (int i = 1; i < BUFFER_SIZE; i++) {
+        sum_of_diffs += fabs(env->master_buffer[i] - env->master_buffer[i-1]);
+    }
+    dynamic_range = sum_of_diffs / BUFFER_SIZE;
+    
+    // Calculate reward components
+    float reward = 0.0f;
+    
+    // Reward for appropriate loudness (not too quiet, not clipping)
+    if (rms > 0.1f && peak < 0.95f) {
+        reward += 2.0f * rms;
+    } else if (peak > 1.0f) {
+        reward -= 2.0f; // Penalty for clipping
+    } else if (rms < 0.05f) {
+        reward -= 1.0f; // Penalty for too quiet
+    }
+    
+    // Reward for spectral balance
+    if (spectral_centroid > 0.05f && spectral_centroid < 0.3f) {
+        reward += 1.0f;
+    }
+    
+    // Reward for dynamics
+    reward += dynamic_range * 5.0f;
+    
+    // Bonus for track separation
+    float track_separation = 0.0f;
+    for (int t = 0; t < NUM_TRACKS; t++) {
+        if (env->tracks[t].pan < -0.2f || env->tracks[t].pan > 0.2f) {
+            track_separation += 0.25f;
+        }
+    }
+    reward += track_separation;
+    
+    return reward;
+}
+
+// Write observations 
+void write_observations(AudioEnvironment* env, float* obs_ptr) {
+    int obs_idx = 0;
+    
+    // Write track parameters (4 tracks * 8 parameters = 32 values)
+    for (int t = 0; t < NUM_TRACKS && obs_idx < OBS_DIM; t++) {
+        if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->tracks[t].oscillator_mix;
+        if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->tracks[t].filter_cutoff;
+        if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->tracks[t].filter_resonance;
+        if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->tracks[t].envelope_attack;
+        if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->tracks[t].envelope_release;
+        if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = (env->tracks[t].pitch - 36.0f) / 48.0f;
+        if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->tracks[t].volume;
+        if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = (env->tracks[t].pan + 1.0f) * 0.5f;
+    }
+    
+    // Write sequencer state (simplified - just active states for now)
+    for (int t = 0; t < NUM_TRACKS && obs_idx < OBS_DIM; t++) {
+        for (int s = 0; s < 16 && obs_idx < OBS_DIM; s++) {
+            if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->tracks[t].notes[s].active ? 1.0f : 0.0f;
+        }
+    }
+    
+    // Write global parameters
+    if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = (env->tempo - 60.0f) / 120.0f;
+    if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->master_volume;
+    
+    // Fill remaining with zeros
+    while (obs_idx < OBS_DIM) {
+        obs_ptr[obs_idx++] = 0.0f;
+    }
+}
+
+// PufferLib interface functions
 void c_reset(MusicGen* env) {
-    env->x = 0;
-    env->goal = (rand()%2 == 0) ? env->size : -env->size;
+    if (!env->env_initialized) {
+        init_audio_environment(&env->audio_env);
+        env->env_initialized = 1;
+    }
+    
+    // Reset audio environment
+    init_audio_environment(&env->audio_env);
+    generate_audio(&env->audio_env);
+    write_observations(&env->audio_env, env->observations);
+    
+    env->terminals[0] = 0;
 }
 
 void c_step(MusicGen* env) {
-    env->rewards[0] = 0;
+    // Apply action and generate audio
+    apply_action(&env->audio_env, env->actions);
+    generate_audio(&env->audio_env);
+    
+    // Calculate reward
+    env->rewards[0] = calculate_reward(&env->audio_env);
+    
+    // Write new observations
+    write_observations(&env->audio_env, env->observations);
+    
+    // Audio environments typically don't terminate
     env->terminals[0] = 0;
-    if (env->actions[0] == 0) {
-        env->x -= 1;
-    } else if (env->actions[0] == 1) {
-        env->x += 1;
-    }
-    if (env->x == env->goal) {
-        c_reset(env);
-        env->rewards[0] = 1;
-        env->terminals[0] = 1;
-        env->log.score += 1;
-        env->log.n += 1;
-    } else if (env->x == -env->goal) {
-        c_reset(env);
-        env->rewards[0] = -1;
-        env->terminals[0] = 1;
-        env->log.score -= 1;
-        env->log.n += 1;
-    }
-    env->observations[0] = (env->goal > 0) ? 1 : -1;
+    
+    // Update log
+    env->log.score += env->rewards[0];
+    env->log.n += 1;
 }
 
 void c_render(MusicGen* env) {
-    if (!IsWindowReady()) {
-        InitWindow(1080, 720, "PufferLib MusicGen");
-        SetTargetFPS(5);
-    }
-
     if (IsKeyDown(KEY_ESCAPE)) {
         exit(0);
     }
-
-    DrawText("Go to the red square!", 20, 20, 20, PUFF_WHITE);
-    DrawRectangle(540 - 32 + 64*env->goal, 360 - 32, 64, 64, PUFF_RED);
-    DrawRectangle(540 - 32 + 64*env->x, 360 - 32, 64, 64, PUFF_CYAN);
-
+    
+    if (env->client == NULL) {
+        env->client = make_client();
+    }
+    
     BeginDrawing();
     ClearBackground(PUFF_BACKGROUND);
+    
+    // Draw title
+    DrawText("Audio RL Environment", 20, 20, 24, PUFF_WHITE);
+    
+    // Draw current reward
+    char reward_text[64];
+    sprintf(reward_text, "Reward: %.3f", env->rewards[0]);
+    DrawText(reward_text, 20, 60, 20, PUFF_WHITE);
+    
+    // Draw track states
+    for (int t = 0; t < NUM_TRACKS; t++) {
+        int y_offset = 120 + t * 120;
+        
+        // Track label
+        char track_text[32];
+        sprintf(track_text, "Track %d", t + 1);
+        DrawText(track_text, 20, y_offset, 18, PUFF_WHITE);
+        
+        // Volume bar
+        int volume_width = (int)(env->audio_env.tracks[t].volume * 200);
+        DrawRectangle(120, y_offset, volume_width, 20, PUFF_GREEN);
+        DrawRectangleLines(120, y_offset, 200, 20, PUFF_WHITE);
+        
+        // Step pattern (16 steps)
+        for (int s = 0; s < 16; s++) {
+            int x = 120 + s * 30;
+            int y = y_offset + 30;
+            Color step_color = env->audio_env.tracks[t].notes[s].active ? PUFF_CYAN : PUFF_RED;
+            DrawRectangle(x, y, 25, 25, step_color);
+            DrawRectangleLines(x, y, 25, 25, PUFF_WHITE);
+        }
+        
+        // Parameters
+        char param_text[128];
+        sprintf(param_text, "Vol:%.2f Cut:%.2f Mix:%.2f Pan:%.2f", 
+                env->audio_env.tracks[t].volume,
+                env->audio_env.tracks[t].filter_cutoff,
+                env->audio_env.tracks[t].oscillator_mix,
+                env->audio_env.tracks[t].pan);
+        DrawText(param_text, 120, y_offset + 65, 14, PUFF_WHITE);
+    }
+    
+    // Draw waveform (simplified)
+    int waveform_y = 650;
+    int waveform_samples = 1000; // Sample down for display
+    int step = BUFFER_SIZE / waveform_samples;
+    
+    for (int i = 0; i < waveform_samples - 1; i++) {
+        float sample1 = env->audio_env.master_buffer[i * step] * 50; // Scale for display
+        float sample2 = env->audio_env.master_buffer[(i + 1) * step] * 50;
+        
+        DrawLine(20 + i, waveform_y + (int)sample1, 
+                21 + i, waveform_y + (int)sample2, PUFF_YELLOW);
+    }
+    
     EndDrawing();
 }
 
 void c_close(MusicGen* env) {
-    if (IsWindowReady()) {
-        CloseWindow();
+    // Close graphics client if it exists
+    if (env->client != NULL) {
+        close_client(env->client);
+        env->client = NULL;
     }
+    
+    // Clear audio environment state
+    if (env->env_initialized) {
+        memset(&env->audio_env, 0, sizeof(AudioEnvironment));
+        env->env_initialized = 0;
+    }
+    
+    // Clear all arrays to avoid dangling pointers
+    if (env->observations) {
+        memset(env->observations, 0, OBS_DIM * sizeof(float));
+    }
+    if (env->actions) {
+        memset(env->actions, 0, ACTION_DIM * sizeof(float));
+    }
+    if (env->rewards) {
+        env->rewards[0] = 0.0f;
+    }
+    if (env->terminals) {
+        env->terminals[0] = 0;
+    }
+    
+    // Reset log
+    env->log.score = 0.0f;
+    env->log.n = 0.0f;
 }
