@@ -12,20 +12,6 @@ typedef struct Client {
     int height;
 } Client;
 
-Client* make_client() {
-    Client* client = (Client*)malloc(sizeof(Client));
-    client->width = 1080;
-    client->height = 720;
-    InitWindow(client->width, client->height, "PufferLib Music Generator");
-    SetTargetFPS(30);
-    return client;
-}
-
-void close_client(Client* client) {
-    CloseWindow();
-    free(client);
-}
-
 // Helper functions for C compatibility
 static inline float min_f(float a, float b) { return (a < b) ? a : b; }
 static inline float max_f(float a, float b) { return (a > b) ? a : b; }
@@ -433,7 +419,11 @@ void c_render(MusicGen* env) {
     }
     
     if (env->client == NULL) {
-        env->client = make_client();
+        InitWindow(1080, 720, "PufferLib Music Generator");
+        SetTargetFPS(30);
+        env->client = (Client*)calloc(1, sizeof(Client));
+        env->client->width = 1080;
+        env->client->height = 720;
     }
     
     BeginDrawing();
@@ -499,7 +489,8 @@ void c_render(MusicGen* env) {
 void c_close(MusicGen* env) {
     // Close graphics client if it exists
     if (env->client != NULL) {
-        close_client(env->client);
+        CloseWindow();
+        free(env->client);
         env->client = NULL;
     }
     
