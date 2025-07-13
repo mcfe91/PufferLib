@@ -6,6 +6,12 @@
 #include <stdio.h>
 #include "raylib.h"
 
+// Only use floats!
+typedef struct {
+    float score;
+    float n; // Required as the last field 
+} Log;
+
 // Client struct for graphics
 typedef struct Client {
     int width;
@@ -27,8 +33,8 @@ const Color PUFF_YELLOW = (Color){187, 187, 0, 255};
 
 // Audio engine constants
 #define NUM_TRACKS 4
-#define OBS_DIM 128
-#define ACTION_DIM 336  // 80 + 4 * 16 * 4
+#define OBS_DIM 290  // 32 + 256 + 2
+#define ACTION_DIM 290 // 32 + 256 + 2
 #define SAMPLE_RATE 44100
 #define BUFFER_SIZE SAMPLE_RATE * 2 // 1 bar at 120 BPM (2 seconds)
 
@@ -79,23 +85,17 @@ typedef struct {
     } effects;
 } AudioEnvironment;
 
-// Only use floats!
-typedef struct {
-    float score;
-    float n; // Required as the last field 
-} Log;
-
 typedef struct {
     Log log;                     // Required field
-    float* observations;         // 128-dimensional float observations
-    float* actions;              // 336-dimensional float actions
+    Client* client;              // Graphics client
+    float* observations;         // 290-dimensional float observations
+    float* actions;              // 290-dimensional float actions
     float* rewards;              // Required field
     unsigned char* terminals;    // Required field
     
     // Audio engine state
     AudioEnvironment audio_env;  // Embedded audio environment
     int env_initialized;         // Initialization flag
-    Client* client;              // Graphics client
 } MusicGen;
 
 // Initialize audio environment
@@ -185,7 +185,6 @@ void generate_audio(AudioEnvironment* env) {
                 
                 // Apply envelope and filter (simplified for brevity)
                 float attack = env->tracks[t].envelope_attack * SAMPLE_RATE * 0.1f;
-                // Note: release envelope logic removed for simplicity in this version
                 
                 for (int i = step_start; i < step_end; i++) {
                     float envelope = 1.0f;
@@ -219,23 +218,58 @@ void generate_audio(AudioEnvironment* env) {
 void apply_action(AudioEnvironment* env, const float* action) {
     int action_idx = 0;
     
-    // First 16 actions: track parameters (4 tracks * 4 params)
+    // Track parameters: 8 parameters per track × 4 tracks = 32 actions
     for (int t = 0; t < NUM_TRACKS && action_idx < ACTION_DIM; t++) {
-        if (action_idx < ACTION_DIM) {
-            env->tracks[t].volume += action[action_idx] * 0.1f;
-            env->tracks[t].volume = min_f(1.0f, max_f(0.0f, env->tracks[t].volume));
-            action_idx++;
-        }
-        if (action_idx < ACTION_DIM) {
-            env->tracks[t].filter_cutoff += action[action_idx] * 0.1f;
-            env->tracks[t].filter_cutoff = min_f(1.0f, max_f(0.0f, env->tracks[t].filter_cutoff));
-            action_idx++;
-        }
+        // Oscillator mix
         if (action_idx < ACTION_DIM) {
             env->tracks[t].oscillator_mix += action[action_idx] * 0.1f;
             env->tracks[t].oscillator_mix = min_f(1.0f, max_f(0.0f, env->tracks[t].oscillator_mix));
             action_idx++;
         }
+        
+        // Filter cutoff
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].filter_cutoff += action[action_idx] * 0.1f;
+            env->tracks[t].filter_cutoff = min_f(1.0f, max_f(0.0f, env->tracks[t].filter_cutoff));
+            action_idx++;
+        }
+        
+        // Filter resonance
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].filter_resonance += action[action_idx] * 0.1f;
+            env->tracks[t].filter_resonance = min_f(1.0f, max_f(0.0f, env->tracks[t].filter_resonance));
+            action_idx++;
+        }
+        
+        // Envelope attack
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].envelope_attack += action[action_idx] * 0.1f;
+            env->tracks[t].envelope_attack = min_f(1.0f, max_f(0.0f, env->tracks[t].envelope_attack));
+            action_idx++;
+        }
+        
+        // Envelope release
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].envelope_release += action[action_idx] * 0.1f;
+            env->tracks[t].envelope_release = min_f(1.0f, max_f(0.0f, env->tracks[t].envelope_release));
+            action_idx++;
+        }
+        
+        // Track-level pitch
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].pitch += action[action_idx] * 12.0f; // ±12 semitones
+            env->tracks[t].pitch = min_f(84.0f, max_f(36.0f, env->tracks[t].pitch)); // C3 to C7
+            action_idx++;
+        }
+        
+        // Volume
+        if (action_idx < ACTION_DIM) {
+            env->tracks[t].volume += action[action_idx] * 0.1f;
+            env->tracks[t].volume = min_f(1.0f, max_f(0.0f, env->tracks[t].volume));
+            action_idx++;
+        }
+        
+        // Pan
         if (action_idx < ACTION_DIM) {
             env->tracks[t].pan += action[action_idx] * 0.1f;
             env->tracks[t].pan = min_f(1.0f, max_f(-1.0f, env->tracks[t].pan));
@@ -243,7 +277,7 @@ void apply_action(AudioEnvironment* env, const float* action) {
         }
     }
     
-    // Remaining actions: sequencer patterns (4 tracks * 16 steps * 4 params)
+    // Sequencer patterns: 4 tracks × 16 steps × 4 params = 256 actions
     int samples_per_step = BUFFER_SIZE / 16;
     
     for (int t = 0; t < NUM_TRACKS && action_idx < ACTION_DIM; t++) {
@@ -258,26 +292,44 @@ void apply_action(AudioEnvironment* env, const float* action) {
                 action_idx++;
             }
             
-            // Pitch
+            // Note-level pitch (relative to track pitch)
             if (action_idx < ACTION_DIM) {
-                float pitch_offset = action[action_idx] * 12.0f;
-                env->tracks[t].notes[s].pitch = 48.0f + t * 12.0f + pitch_offset;
+                float pitch_offset = action[action_idx] * 12.0f; // ±12 semitones from track pitch
+                env->tracks[t].notes[s].pitch = env->tracks[t].pitch + pitch_offset;
+                env->tracks[t].notes[s].pitch = min_f(84.0f, max_f(36.0f, env->tracks[t].notes[s].pitch));
                 action_idx++;
             }
             
             // Duration
             if (action_idx < ACTION_DIM) {
-                float steps_duration = (action[action_idx] + 1.0f) * 2.0f;
+                float steps_duration = (action[action_idx] + 1.0f) * 2.0f; // 0-4 steps
                 env->tracks[t].notes[s].duration_samples = (int)(steps_duration * samples_per_step);
+                env->tracks[t].notes[s].duration_samples = min_i(BUFFER_SIZE, max_i(0, env->tracks[t].notes[s].duration_samples));
                 action_idx++;
             }
             
             // Velocity
             if (action_idx < ACTION_DIM) {
-                env->tracks[t].notes[s].velocity = (action[action_idx] + 1.0f) * 0.5f;
+                env->tracks[t].notes[s].velocity = (action[action_idx] + 1.0f) * 0.5f; // 0-1 range
+                env->tracks[t].notes[s].velocity = min_f(1.0f, max_f(0.0f, env->tracks[t].notes[s].velocity));
                 action_idx++;
             }
         }
+    }
+    
+    // Global parameters: 2 actions
+    // Tempo
+    if (action_idx < ACTION_DIM) {
+        env->tempo += action[action_idx] * 10.0f; // ±10 BPM
+        env->tempo = min_f(200.0f, max_f(60.0f, env->tempo)); // 60-200 BPM
+        action_idx++;
+    }
+    
+    // Master volume
+    if (action_idx < ACTION_DIM) {
+        env->master_volume += action[action_idx] * 0.1f;
+        env->master_volume = min_f(1.0f, max_f(0.0f, env->master_volume));
+        action_idx++;
     }
 }
 
@@ -349,6 +401,7 @@ float calculate_reward(AudioEnvironment* env) {
 // Write observations 
 void write_observations(AudioEnvironment* env, float* obs_ptr) {
     int obs_idx = 0;
+    int samples_per_step = BUFFER_SIZE / 16;
     
     // Write track parameters (4 tracks * 8 parameters = 32 values)
     for (int t = 0; t < NUM_TRACKS && obs_idx < OBS_DIM; t++) {
@@ -362,10 +415,24 @@ void write_observations(AudioEnvironment* env, float* obs_ptr) {
         if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = (env->tracks[t].pan + 1.0f) * 0.5f;
     }
     
-    // Write sequencer state (simplified - just active states for now)
+    // Write sequencer state (4 tracks * 16 steps * 4 params = 256 values)
     for (int t = 0; t < NUM_TRACKS && obs_idx < OBS_DIM; t++) {
         for (int s = 0; s < 16 && obs_idx < OBS_DIM; s++) {
-            if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->tracks[t].notes[s].active ? 1.0f : 0.0f;
+            // Active state (0.0 or 1.0)
+            if (obs_idx < OBS_DIM) 
+                obs_ptr[obs_idx++] = env->tracks[t].notes[s].active ? 1.0f : 0.0f;
+            
+            // Pitch (normalized to 0-1 range)
+            if (obs_idx < OBS_DIM) 
+                obs_ptr[obs_idx++] = (env->tracks[t].notes[s].pitch - 36.0f) / 48.0f;
+            
+            // Duration (normalized)
+            if (obs_idx < OBS_DIM) 
+                obs_ptr[obs_idx++] = (float)env->tracks[t].notes[s].duration_samples / (samples_per_step * 4.0f);
+            
+            // Velocity (already 0-1)
+            if (obs_idx < OBS_DIM) 
+                obs_ptr[obs_idx++] = env->tracks[t].notes[s].velocity;
         }
     }
     
@@ -410,7 +477,7 @@ void c_step(MusicGen* env) {
     
     // Update log
     env->log.score += env->rewards[0];
-    env->log.n += 1;
+    env->log.n += 1.0;
 }
 
 void c_render(MusicGen* env) {
@@ -420,7 +487,7 @@ void c_render(MusicGen* env) {
     
     if (env->client == NULL) {
         InitWindow(1080, 720, "PufferLib Music Generator");
-        SetTargetFPS(30);
+        SetTargetFPS(60);
         env->client = (Client*)calloc(1, sizeof(Client));
         env->client->width = 1080;
         env->client->height = 720;
@@ -487,7 +554,6 @@ void c_render(MusicGen* env) {
 }
 
 void c_close(MusicGen* env) {
-    // Close graphics client if it exists
     if (env->client != NULL) {
         CloseWindow();
         free(env->client);

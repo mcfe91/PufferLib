@@ -7,33 +7,35 @@ import pufferlib
 from pufferlib.ocean.music_gen import binding
 
 class MusicGen(pufferlib.PufferEnv):
-    def __init__(self, num_envs=1, render_mode=None, log_interval=128, buf=None, seed=0):
-        # Update observation space for 128-dimensional float observations
+    def __init__(self, num_envs=1, render_mode=None, log_interval=128, size=5, buf=None, seed=0):
+        # Update observation space for 290-dimensional float observations
         self.single_observation_space = gymnasium.spaces.Box(
             low=0.0, high=1.0,
-            shape=(128,), dtype=np.float32
+            shape=(290,), dtype=np.float32
         )
         
-        # Update action space for 336-dimensional continuous actions
+        # Update action space for 290-dimensional continuous actions
         self.single_action_space = gymnasium.spaces.Box(
             low=-1.0, high=1.0,
-            shape=(336,), dtype=np.float32
+            shape=(290,), dtype=np.float32
         )
         
         self.render_mode = render_mode
         self.num_agents = num_envs
+        self.log_interval = log_interval
 
         super().__init__(buf)
         
         # Initialize C environments with proper data types
         self.c_envs = binding.vec_init(
-            self.observations.astype(np.float32),  # 128-dim float observations
-            self.actions.astype(np.float32),       # 336-dim float actions
+            self.observations.astype(np.float32),  # 290-dim float observations
+            self.actions.astype(np.float32),       # 290-dim float actions
             self.rewards, 
             self.terminals, 
             self.truncations, 
             num_envs, 
-            seed
+            seed,
+            size=size
         )
  
     def reset(self, seed=0):
@@ -41,7 +43,6 @@ class MusicGen(pufferlib.PufferEnv):
         return self.observations, []
 
     def step(self, actions):
-        # Ensure actions are the right type and shape
         self.actions[:] = actions.astype(np.float32)
         binding.vec_step(self.c_envs)
         info = [binding.vec_log(self.c_envs)]
@@ -75,7 +76,7 @@ if __name__ == '__main__':
     CACHE = 512
     
     # Generate random actions in the correct range [-1, 1] for continuous control
-    actions = np.random.uniform(-1.0, 1.0, (CACHE, N, 336)).astype(np.float32)
+    actions = np.random.uniform(-1.0, 1.0, (CACHE, N, 290)).astype(np.float32)
     
     print(f"Action shape: {actions.shape}")
     print("Starting performance test...")
@@ -84,13 +85,13 @@ if __name__ == '__main__':
     start = time.time()
     total_reward = 0.0
     
-    while time.time() - start < 10:
+    while time.time() - start < 100:
         obs, rewards, terminals, truncations, info = env.step(actions[steps % CACHE])
         total_reward += np.mean(rewards)
         steps += 1
         
-        # Print progress every 100 steps
-        if steps % 100 == 0:
+        # Print progress every 10 steps
+        if steps % 10 == 0:
             elapsed = time.time() - start
             sps = env.num_agents * steps / elapsed
             avg_reward = total_reward / steps
