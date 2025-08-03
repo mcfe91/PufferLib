@@ -95,7 +95,6 @@ typedef struct {
     
     // Audio engine state
     AudioEnvironment audio_env;  // Embedded audio environment
-    int env_initialized;         // Initialization flag
 } MusicGen;
 
 // Initialize audio environment
@@ -439,29 +438,19 @@ void write_observations(AudioEnvironment* env, float* obs_ptr) {
     // Write global parameters
     if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = (env->tempo - 60.0f) / 120.0f;
     if (obs_idx < OBS_DIM) obs_ptr[obs_idx++] = env->master_volume;
-    
-    // Fill remaining with zeros
-    while (obs_idx < OBS_DIM) {
-        obs_ptr[obs_idx++] = 0.0f;
-    }
 }
 
 // PufferLib interface functions
 void c_reset(MusicGen* env) {
-    if (!env->env_initialized) {
-        init_audio_environment(&env->audio_env);
-        env->env_initialized = 1;
-    }
-    
-    // Reset audio environment
     init_audio_environment(&env->audio_env);
-    generate_audio(&env->audio_env);
-    write_observations(&env->audio_env, env->observations);
     
-    env->terminals[0] = 0;
+    write_observations(&env->audio_env, env->observations);
 }
 
 void c_step(MusicGen* env) {
+    env->rewards[0] = 0;
+    env->terminals[0] = 0;
+
     // Apply action and generate audio
     apply_action(&env->audio_env, env->actions);
     generate_audio(&env->audio_env);
@@ -557,30 +546,5 @@ void c_close(MusicGen* env) {
     if (env->client != NULL) {
         CloseWindow();
         free(env->client);
-        env->client = NULL;
     }
-    
-    // Clear audio environment state
-    if (env->env_initialized) {
-        memset(&env->audio_env, 0, sizeof(AudioEnvironment));
-        env->env_initialized = 0;
-    }
-    
-    // Clear all arrays to avoid dangling pointers
-    if (env->observations) {
-        memset(env->observations, 0, OBS_DIM * sizeof(float));
-    }
-    if (env->actions) {
-        memset(env->actions, 0, ACTION_DIM * sizeof(float));
-    }
-    if (env->rewards) {
-        env->rewards[0] = 0.0f;
-    }
-    if (env->terminals) {
-        env->terminals[0] = 0;
-    }
-    
-    // Reset log
-    env->log.score = 0.0f;
-    env->log.n = 0.0f;
 }

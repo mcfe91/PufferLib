@@ -4,9 +4,7 @@
 #include "../env_binding.h"
 
 static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
-    // Audio engine doesn't need additional parameters
     // Initialize any environment-specific parameters here if needed
-    env->env_initialized = 0;  // Will be set to 1 in c_reset
     return 0;
 }
 

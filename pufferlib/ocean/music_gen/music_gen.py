@@ -28,8 +28,8 @@ class MusicGen(pufferlib.PufferEnv):
         
         # Initialize C environments with proper data types
         self.c_envs = binding.vec_init(
-            self.observations.astype(np.float32),  # 290-dim float observations
-            self.actions.astype(np.float32),       # 290-dim float actions
+            self.observations,  # 290-dim float observations
+            self.actions,       # 290-dim float actions
             self.rewards, 
             self.terminals, 
             self.truncations, 
@@ -43,7 +43,7 @@ class MusicGen(pufferlib.PufferEnv):
         return self.observations, []
 
     def step(self, actions):
-        self.actions[:] = actions.astype(np.float32)
+        self.actions[:] = actions
         binding.vec_step(self.c_envs)
         info = [binding.vec_log(self.c_envs)]
         return (self.observations, self.rewards,
